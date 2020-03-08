@@ -13,6 +13,22 @@ from   .models                          import *
 class ExperimentBase(nauka.exp.Experiment):
     """
     The base class for all experiments.
+
+    NOTE: This class inherits from nauka.exp.Experiment. 
+    An experiment comprises both an in-memory state and an on-disk state. At
+	regular intervals, the in-memory state is synchronized with the on-disk
+	state, thus permitting a resume should the experiment be killed. These
+	on-disk serializations are called "snapshots".
+
+    some of the methods are:
+     load(self, path): Load state of the experiment from given path.
+     dump(self, path): Dump state to the directory path
+     fromScratch(self): Start an experiment from a snapshot
+     snapshot(self) : Take a snapshot of the experiment (uses dump(self, path) )
+     purge(self, ...): Purge snapshot directory of all the snapshots preserving
+                       only some of those (e.g. the last one)
+
+
     """
     def __init__(self, a):
         self.a = type(a)(**a.__dict__)
@@ -216,12 +232,12 @@ class Experiment(ExperimentBase):
             # 0) Initialize a new ground truth model with the same causal graph
             # ==================================================================
             self.S.model.alterdists()           # reinitialize randomly the weights of the ground truth model
-                                                # (but keep the struct of the causal graph gammagt unchanged)
+                                                # (but keep the struct of the causal graph ( gammagt ) unchanged)
             self.S.model.zero_fastparams()      # Set to zero the fast parameters of the learner
             
             
             # ==================================================================
-            # 1) Train functional parameters only Loop
+            # 1) Train slow parameters only Loop (to adapt to new ground truth model)
             # ==================================================================
             if self.a.train_functional:
                 smpiter = self.S.model.sampleiter(self.a.batch_size) # An iterator of batch_size samples from the ground truth model
@@ -229,15 +245,21 @@ class Experiment(ExperimentBase):
 
                 # Train the functional parameters
                 for b, (batch, config) in self.brk(enumerate(zip(smpiter, cfgiter)), max=self.a.train_functional):
-                    self.S.msoptimizer.zero_grad()
+                    self.S.msoptimizer.zero_grad()                          # self.S.msoptimizer optimizes only the slow parameters of the learner net
+                    # NLL: negative log likelihood
                     nll = -self.S.model.logprob(batch, config)[0].mean()    # Compute the loss from the learner on the batch with that config (using fast + slow params)
-                    nll.backward()
-                    self.S.msoptimizer.step()
+                    nll.backward()                                          # Compute the gradients
+                    self.S.msoptimizer.step()                               # Train the slow parameters of the learner network
                     if self.a.verbose and b % self.a.verbose == 0:
                         logging.info("Train functional param only NLL: "+str(nll.item()))
             
             # ==================================================================
             # 2) Interventions Loop
+            #    2.1) An intervention is done
+            #    2.2) Estimate the node upon which the intervention was made
+            #    2.3) Compute the loss / gradients w.r.t the intervention node [TODO NON L'HO CAPITA DEL TUTTO]
+            #    2.4) Adapt the fast parameters of the learner to the intervention
+            #    2.5) Optimize gamma
             # ==================================================================
             for j in self.brk(range(self.a.ipd)):
                 if j>0: self.S.stepNum += 1
@@ -246,7 +268,15 @@ class Experiment(ExperimentBase):
                 """Perform intervention under guard."""
                 # Perform an intervention which modifies the ground truth model at the beginning fo the loop
                 # and undo it at the end of the loop
+
+                # ==============================================================
+                # 2.1) An intervention is done
+                # ==============================================================
                 with self.S.model.intervene() as intervention:  
+
+                    # ==========================================================
+                    # 2.2) Estimate the node upon which the intervention was made
+                    # ==========================================================
                     """Possibly attempt to predict the intervention node,
                        instead of relying on knowledge of it."""
                     if self.a.predict:
@@ -261,8 +291,8 @@ class Experiment(ExperimentBase):
                             # TODO [Simone M.]: It might be better to select the node where the difference
                             # NLL_after_intervention - NLL_before_intervention is the biggest ?
 
-                            for batch in self.brk(smpiter, max=self.a.predict):
-                                for config in self.brk(cfgiter, max=self.a.predict_cpb):
+                            for batch in self.brk(smpiter, max=self.a.predict):             # Average result on self.a.predict batches
+                                for config in self.brk(cfgiter, max=self.a.predict_cpb):    # Average the result on self.a.predict_cpb causal structures drawn
                                     accnll += -self.S.model.logprob(batch, config)[0].mean(0)
                             selnode = torch.argmax(accnll).item()
                             logging.info("Predicted Intervention Node: {}  Actual Intervention Node: {}".format([selnode], list(iter(intervention))))
@@ -271,6 +301,10 @@ class Experiment(ExperimentBase):
                     self.S.goptimizer.zero_grad()
                     self.S.model.gamma.grad = torch.zeros_like(self.S.model.gamma)
                     
+                    # ==========================================================
+                    # 2.3) Compute the loss / gradients [TODO NON L'HO CAPITA DEL TUTTO]
+                    # ==========================================================                    
+
                     gammagrads = [] # List of T tensors of shape (M,M,) indexed by (i,j)
                     logregrets = [] # List of T tensors of shape (M,)   indexed by (i,)
                     
@@ -281,25 +315,36 @@ class Experiment(ExperimentBase):
                         logregret = 0
                         
                         """Configurations Loop"""
-                        cfgiter = self.S.model.configiter()
-                        for config in self.brk(cfgiter, max=self.a.cpi):
+                        cfgiter = self.S.model.configiter()             # An iterator of causal structures drawn from the learner parameters gamma
+                        for config in self.brk(cfgiter, max=self.a.cpi):# For each intervention, consider self.a.cpi configurations
                             """Accumulate Gamma Gradient"""
-                            if self.a.predict:
+                            if self.a.predict:                          # If the intervention node has been estimated
+                                # Compute the loss only for the intervention node [TODO NON NE SONO SICURO!]
                                 logpn, logpi = self.S.model.logprob(batch, config, block=intervention)
                             else:
+                                # Compute the loss for all nodes
                                 logpn, logpi = self.S.model.logprob(batch, config)
                             with torch.no_grad():
+
+                                # TODO: Why are gradients computed in this way?
                                 gammagrad += self.S.model.gamma.sigmoid() - config
                                 logregret += logpn.mean(0)
-                            logpi.sum(1).mean(0).backward()
+                            logpi.sum(1).mean(0).backward()             # Compute the gradients
                         
                         gammagrads.append(gammagrad)
                         logregrets.append(logregret)
                     
+
+                    # ==========================================================
+                    # 2.4) Adapt the fast parameters of the learner to the intervention
+                    # ==========================================================
                     """Update Fast Optimizer"""
+                    # Train the fast parameters of the learner with the model_optimizer
+                    # to adapt to the interventon
                     for batch in self.brk(smpiter, max=self.a.xfer_epi_size):
                         self.S.model.zero_fastparams()
-                        self.S.mfoptimizer = nauka.utils.torch.optim.fromSpec(self.S.model.parameters_fast(), self.a.model_optimizer)
+                        self.S.mfoptimizer = nauka.utils.torch.optim.fromSpec(
+                            self.S.model.parameters_fast(), self.a.model_optimizer)
                         self.S.mfoptimizer.zero_grad()
                         cfgiter = self.S.model.configiter()
                         for config in self.brk(cfgiter, max=self.a.cpi):
@@ -312,12 +357,17 @@ class Experiment(ExperimentBase):
                         for config in self.brk(cfgiter, max=self.a.cpi):
                             all_logprobs.append(self.S.model.logprob(batch, config)[0].mean())
                     
-                    
+                    # ==========================================================
+                    # 2.5) Optimize gamma
+                    # ==========================================================
                     """Gamma Gradient Estimator"""
                     with torch.no_grad():
                         gammagrads = torch.stack(gammagrads)
                         logregrets = torch.stack(logregrets)
                         normregret = logregrets.softmax(0)
+
+                        # R is the meta-objective (loss) for the slow params [see paper]
+                        # dRdgamma are its gradients w.r.t. gamma
                         dRdgamma   = torch.einsum("kij,ki->ij", gammagrads, normregret)
                         self.S.model.gamma.grad.copy_(dRdgamma)
                         all_logprobs = torch.stack(all_logprobs).mean()

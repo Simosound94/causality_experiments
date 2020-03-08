@@ -259,6 +259,9 @@ class CategoricalWorld(World):
         while True:
             with torch.no_grad():
                 gammaexp = self.gamma.sigmoid()
+
+                # computes a vector V [M x M] randomly sampled from uniform distrib
+                # Then returns a binary vector gammaexp = V < gammaexp (elementwise)
                 gammaexp = torch.empty_like(gammaexp).uniform_().lt_(gammaexp)
                 # set the diagonal of gamma to 0, a node cannot be parent of himself
                 gammaexp.diagonal().zero_() 
@@ -313,7 +316,7 @@ class CategoricalWorld(World):
     
     def logits(self, sample, config, traingt=False):
         """
-        Forward propagation through the learner network 
+        Forward propagation through the ground truth or learner network 
 
         Args:
             sample = (bs, M, N) the input to the network
@@ -345,9 +348,11 @@ class CategoricalWorld(World):
         
         block = [block] if isinstance(block, int) else list(set(iter(block)))
         block = torch.as_tensor(block, dtype=torch.long, device=sample.device)
+        # Compute the network output
         block = torch.ones(self.M, device=sample.device).index_fill_(0, block, 0)
         v = self.logits(sample, config, traingt=traingt) / self.a.temperature
         v = v.log_softmax(dim=2)
+        # compute the loss
         v = torch.einsum("bio,bio->bi", v, sample)
         vn = torch.einsum("bi,i->bi", v, 0+block)
         vi = torch.einsum("bi,i->bi", v, 1-block)
